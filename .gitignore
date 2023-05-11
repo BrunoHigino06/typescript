@@ -1,0 +1,13 @@
+!jest.config.js
+*.d.ts
+/bin/*.js
+**/infra/**/*.js
+**/sources/code_examples/**/*.js
+**/test/**/*.js
+!**/sources/code_examples/onpremise/*.js
+node_modules
+test/test-reports
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+dist

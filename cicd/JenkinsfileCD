@@ -1,0 +1,264 @@
+#!groovy
+@Library(['global-pipeline-library@release/v9.1',
+          'security-library@release/v2.0'])_
+
+import com.mapfre.pod.Container
+import com.mapfre.pod.ContainerType
+import com.mapfre.pod.ContainerTypeCustom
+import com.mapfre.pod.ContainerSize
+
+//NOMBRE DE TU ORGANIZACION  
+def DEVOPS_PLATFORM_ORGANIZATION = 'org-mapfrebrasil'
+
+pipeline {
+
+  //Use especific container for  custom agent.
+  agent {
+        kubernetes {
+           yaml getPodTemplate(DEVOPS_PLATFORM_ORGANIZATION,[
+                    ['cdk', new ContainerTypeCustom('acrmapfredevops.azurecr.io/mapfre/global/mapfrecdk:1.0.33', 'Always', 'cat'), ContainerSize.LARGE], 
+                    //['sonar-scanner-cli', ContainerType.SONAR_SCANNER_CLI_STABLE, ContainerSize.SMALL],
+                    ['azure-cli', ContainerType.AZURE_CLI_STABLE, ContainerSize.SMALL]
+            ] as Container[], true)
+        }
+  }
+
+  
+   options {
+        timeout(time: 25, unit: 'MINUTES')
+        timestamps()
+        azureKeyVault(
+          secrets: [
+            [envVariable: 'AWS-ACCESS-KEY-ID-' + getIdProduct() + '-' + getSynthEnv(), name: 'AWS-ACCESS-KEY-ID-' + getIdProduct() + '-' + getSynthEnv(), secretType: 'Secret'],
+            [envVariable: 'AWS-SECRET-ACCESS-KEY-' + getIdProduct() + '-' + getSynthEnv(), name: 'AWS-SECRET-ACCESS-KEY-' + getIdProduct() + '-' + getSynthEnv(), secretType: 'Secret'],
+            [envVariable: 'ACCOUNTID', name: 'AWS-ACCOUNT-ID-' + getIdProduct() + '-' + getSynthEnv(), secretType: 'Secret'],
+            [envVariable: 'REGION', name: 'AWS-REGION-' + getIdProduct() + '-' + getSynthEnv(), secretType: 'Secret'],
+          ]
+        )
+  }
+  
+  
+  environment { 
+        PACKAGE_NAME= 'bff-package'
+        KEY_VAULT_URL               = 'https://do-pro-e57836-mapbr.vault.azure.net/'
+        KEY_VAULT_CREDENTIAL_ID     = 'd1ab1e7a-f411-48fa-ba8a-cf2dc3a1fd70'
+        VERSION       = "$TAG_NAME"
+        ENVIRONMENT = getDeployEnv(VERSION)
+  }
+
+  stages {
+
+
+     stage('🔧 Prepare Environment') {
+      steps {     
+          script {
+                container('cdk'){
+                    awsLogin(ACCOUNTID,'AWS-ACCESS-KEY-ID-' + getIdProduct() + '-' + getSynthEnv(),'AWS-SECRET-ACCESS-KEY-' + getIdProduct() + '-' + getSynthEnv(),REGION)
+                    
+                    def secrets = [
+                        secret("app-user-azure-artifacts-username", 'v_pass')//Usuario para conectar no Aza que por default era app-devopsmapfre-artifacts-base64
+                    ]
+                    withKeyVaultSecret(secrets) {
+                        env.BASE64_ENCODED_PERSONAL_ACCESS_TOKEN = "${v_pass}"
+                    }
+                }
+          }
+      }
+    }
+
+    stage('Security pre-build'){
+      steps{
+            script{
+                  secPreBuild()
+            }
+      }
+    }
+
+
+     //Download Artifacts and prepare deployment
+    stage('Download Artifacts/Install Dependencies.'){
+
+        
+      steps {
+            script{
+              def secrets = [
+                  secret("app-user-azure-artifacts-password",'pat')
+              ]              
+
+              container('cdk'){    
+
+                  withKeyVaultSecret(secrets) {  
+                      universalPackageDownload('releases', PACKAGE_NAME, VERSION, '.', pat)
+                  }
+              
+                
+                  unzip zipFile: 'backend.zip', dir: './deploy'  
+
+                  //Install dependencies    
+                  dir("deploy"){
+                    npmInstall()
+                  }
+                 
+
+              }                  
+
+          }
+      }
+    }
+
+
+   stage('Validate Aspects') {
+        steps {
+          container('cdk'){
+              script{            
+                validateAspects()
+            }
+          }
+        }
+   }
+
+   stage('🔒 Security post-build'){
+      steps {
+        script{
+          secPostBuild()
+        }
+      }
+    }
+
+    
+   stage('Security pre-deploy'){
+      steps {
+            script{
+                  secPreDeploy()
+            }
+      }
+    }
+
+    
+    
+    stage('Deploy 🚀') {
+
+        
+      steps {
+        container('cdk'){
+          script{     
+            cdkDeploy()      
+          }
+        }
+      }
+    }
+
+  
+
+    stage('Security post-deploy'){
+      steps{
+            script{
+                  secPostDeploy()
+            }
+      }
+    }
+
+  }
+
+
+   post {
+      always {
+          echo '--always--'
+          showStageStatus()
+          //logstashSend failBuild: false, maxLines: 150000
+      }
+      success {
+          echo '--success--'
+      }
+      failure {
+          echo '--failure--'
+          script {
+            GIT_COMMIT_EMAIL = sh (
+              script: 'git --no-pager show -s --format=\'%ae\'',
+              returnStdout: true
+            ).trim()
+          }
+          echo "TARGET ${GIT_COMMIT_EMAIL}"
+          sendFailureEmail GIT_COMMIT_EMAIL
+      }
+  }
+
+}
+
+def cdkDeploy() {
+    sh """
+    cd ./deploy      
+    cdk bootstrap -c env=$ENVIRONMENT --all             
+    cdk deploy -c env=$ENVIRONMENT --all --require-approval never
+    """
+}
+
+//Obtener entorno en función del tipo de tag hf rc PRE y x.y.z PRO
+def String getDeployEnv(version) {
+    
+    def environment=''
+
+    if ( version.contains('rc') || version.contains('hf') ) {
+          environment='INT' // rc y hf
+    } else { 
+          environment='PRO'
+    }
+
+    return environment
+}
+
+def String getIdProduct(){
+  return "PIPEFY"
+}
+
+def validateAspects() {
+    
+    sh """            
+
+    
+    app="\$(grep -c 'App()' bin/app.ts | cut -d ' ' -f2)"
+    aspects="\$(grep -c 'MARValidation(' bin/app.ts)"
+    comment="\$(grep -w 'MARValidation' bin/app.ts | cut -c 1-2)"
+    openComment="\$(grep -B200 'MARValidation' bin/app.ts | grep '/\\*' -c)"
+    closeComment="\$(grep -B200 'MARValidation' bin/app.ts | grep '\\*/' -c)"
+    
+    if [ \$app == 0 ];
+    then 
+        echo "ERROR: There is no cdk app line" 
+        error "ERROR: Aspects"
+    elif [ \$app -gt 1 ];
+    then 
+        echo "ERROR: There are more than 1 aplication" 
+        error "ERROR: Aspects"
+    fi
+    
+    if [ \$aspects != 1 ];
+    then 
+        echo "ERROR: There is no aspect validation line" 
+        error "ERROR: Aspects"
+    fi
+    
+    if [ \$comment == "//" ];
+    then 
+        echo "ERROR: Aspects are commented" 
+        error "ERROR: Aspects"
+    else 
+        echo "Aspects are included"
+    fi
+
+    if [ \$openComment -gt \$closeComment ];
+    then 
+        echo "ERROR: Aspects are commented"
+        error "ERROR: Aspects"
+    fi
+
+    """    
+}
+
+def String getSynthEnv(){
+    
+    def environment="INT"
+
+    
+    return environment
+}
