@@ -4,7 +4,7 @@ import { setResourceName } from '../infra/lib/helpers/resource-naming-helper';
 import { EnvironmentHelper } from '../infra/lib/helpers/environment-helper';
 import * as marAspects from '@mapfre-mar/cdk-mar-aspects';
 import { LambdaStack } from '../infra/lib/index';
-
+import { RdsStack } from '../infra/lib/index';
 
 const app = new cdk.App();
 
@@ -33,6 +33,12 @@ let marValidation = new marAspects.MARValidation(
 );
 
 let lamdbaStack = new LambdaStack(
+  app,
+  setResourceName(properties.get('stack.lambda')),
+  properties,
+);
+
+let rdsStack = new RdsStack(
   app,
   setResourceName(properties.get('stack.lambda')),
   properties,
